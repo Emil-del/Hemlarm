@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#4b47b8">
+<title>Hemlarm</title>
+<!--
+  Fjärrstyrning av hemlarmet via EMQX (MQTT över WebSocket).
+  Sidan innehåller inga lösenord – de skrivs in vid inloggning och sparas
+  bara i telefonen. BASE måste vara samma som MQTT_BASE i hemlarm.ino.
+-->
+<style>
+:root{--bg:#f4f3ef;--card:#fff;--tx:#1d1d1b;--mu:#6b6a65;--bd:#e2e0d8;--ok:#2f7d4f;--warn:#b7791f;--bad:#c2372f;--acc:#4b47b8}
+@media(prefers-color-scheme:dark){:root{--bg:#141413;--card:#1f1f1d;--tx:#f0efe9;--mu:#a3a29b;--bd:#33322f;--acc:#7f77dd}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin-bottom:14px}
+h2{font-size:15px;margin:0 0 8px;color:var(--mu);font-weight:600}
+#state{font-size:30px;font-weight:700;margin:0}
+.sub{color:var(--mu);font-size:14px;margin:4px 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+button{flex:1;min-width:120px;font:inherit;font-weight:600;padding:14px 10px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--tx);cursor:pointer}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.d{background:var(--bad);border-color:var(--bad);color:#fff}
+input{font:inherit;padding:10px;border-radius:8px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);width:100%}
+label{display:block;font-size:13px;color:var(--mu);margin:10px 0 4px}
+#log{font-size:13px;color:var(--mu);max-height:280px;overflow:auto;font-family:ui-monospace,Menlo,monospace}
+#conn{font-weight:600;margin:0 0 6px}
+.st-disarmed{color:var(--ok)}.st-armed,.st-exit{color:var(--acc)}.st-entry{color:var(--warn)}.st-alarm{color:var(--bad)}
+.stale #state{opacity:.45}
+.msg{font-size:14px;min-height:20px;margin-top:8px}
+.hide{display:none}
+#alarm{position:fixed;inset:0;z-index:9;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:var(--bad);color:#fff;animation:pulse 1s infinite}
+#alarm.hide{display:none}
+#alarm .big{font-size:64px;font-weight:800;line-height:1.1}
+#alarm button{flex:0 0 auto;width:100%;max-width:300px;border:0;background:#fff;color:var(--bad)}
+#alarm button.ghost{background:transparent;color:#fff;border:1px solid #fff}
+@keyframes pulse{50%{background:#8f1f19}}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+</head><body><main>
+
+<section id="login" class="card hide">
+<h2>Logga in</h2>
+<p class="sub">Uppgifterna sparas bara i den här telefonen.</p>
+<label for="lu">Användarnamn (EMQX)</label>
+<input id="lu" value="larm-web" autocomplete="username" autocapitalize="none" spellcheck="false">
+<label for="lp">Lösenord (EMQX)</label>
+<input id="lp" type="password" autocomplete="current-password">
+<label for="lc">Larmkod</label>
+<input id="lc" type="password" inputmode="numeric" autocomplete="off">
+<div class="msg" id="lerr" style="color:var(--bad)"></div>
+<button class="p" style="width:100%" onclick="login()">Logga in</button>
+</section>
+
+<div id="app" class="hide">
+<section class="card">
+<p id="conn" class="sub"></p>
+<p id="state">…</p>
+<p class="sub" id="info"></p>
+<div class="row">
+<button class="p" onclick="cmd('arm_away')">Larma borta</button>
+<button class="p" onclick="cmd('arm_night')">Larma natt</button>
+<button class="d" onclick="cmd('disarm')">Larma av</button>
+</div>
+<div class="msg" id="cmsg"></div>
+</section>
+
+<section class="card">
+<h2>Nattläge</h2>
+<div class="row" style="margin-top:0"><button id="skipbtn" onclick="cmd('night_skip')">Hoppa över nattläget i natt</button></div>
+<p class="sub">Knappsats, larmkod och tider ändras på den lokala sidan hemma (http://larm.local).</p>
+</section>
+
+<section class="card"><h2>Händelser</h2><div id="log"></div></section>
+<p class="sub" style="text-align:center"><a href="#" onclick="logout();return false" style="color:var(--mu)">Logga ut från den här telefonen</a></p>
+</div>
+</main>
+
+<div id="alarm" class="hide">
+<div class="big">LARM!</div>
+<p id="alarmInfo"></p>
+<button onclick="cmd('disarm')">Larma av</button>
+<button class="ghost" onclick="mute()">Tysta telefonen</button>
+</div>
+
+<script>
+const HOST='n9a11741.ala.eu-central-1.emqxsl.com', PORT=8084, BASE='hemlarm';
+const T={status:BASE+'/status',online:BASE+'/online',cmd:BASE+'/cmd',res:BASE+'/res'};
+const $=id=>document.getElementById(id);
+let cred=null,client=null,st=null,espOnline=null,pending={},audio=null,beepTimer=null,muted=false;
+
+function loadCred(){try{return JSON.parse(localStorage.getItem('larm')||'null')}catch(e){return null}}
+function storeCred(v){try{v?localStorage.setItem('larm',JSON.stringify(v)):localStorage.removeItem('larm')}catch(e){}}
+
+function stopClient(){if(client){const c=client;client=null;c.end(true)}setConn()}
+function showLogin(m){
+  stopClient();
+  $('app').classList.add('hide');$('login').classList.remove('hide');
+  $('lerr').textContent=m||'';
+  if(cred){$('lu').value=cred.u||'larm-web';$('lp').value=cred.p||''}
+  $('lc').value='';
+  updateAlarm();
+}
+function showApp(){$('login').classList.add('hide');$('app').classList.remove('hide');render()}
+
+function connect(){
+  stopClient();
+  const c=mqtt.connect('wss://'+HOST+':'+PORT+'/mqtt',{
+    username:cred.u,password:cred.p,
+    clientId:'larm-web-'+Math.random().toString(16).slice(2,10),
+    reconnectPeriod:3000,connectTimeout:10000,clean:true});
+  client=c;
+  c.on('connect',()=>{c.subscribe([T.status,T.online,T.res]);setConn()});
+  c.on('reconnect',setConn);c.on('offline',setConn);c.on('close',setConn);
+  c.on('error',e=>{if([4,5,134,135].includes(e.code))showLogin('Fel användarnamn eller lösenord för EMQX')});
+  c.on('message',(t,m)=>{
+    const s=m.toString();
+    if(t===T.online){espOnline=s==='1';setConn()}
+    else if(t===T.status){try{st=JSON.parse(s);render()}catch(e){}}
+    else if(t===T.res){try{const r=JSON.parse(s),p=pending[r.id];if(p){delete pending[r.id];clearTimeout(p.t);p.f(r)}}catch(e){}}
+  });
+}
+
+function waitConnected(ms){
+  return new Promise(res=>{
+    const c=client;if(!c)return res(false);if(c.connected)return res(true);
+    const t=setTimeout(()=>res(false),ms);
+    c.once('connect',()=>{clearTimeout(t);res(true)});
+    c.once('end',()=>{clearTimeout(t);res(false)});
+  });
+}
+
+function send(a){
+  return new Promise(res=>{
+    if(!client||!client.connected){res({ok:false,msg:'Ingen kontakt med molnet'});return}
+    const id=Math.random().toString(36).slice(2,10);
+    const t=setTimeout(()=>{delete pending[id];res({ok:false,msg:'Larmet svarar inte'})},8000);
+    pending[id]={f:res,t};
+    client.publish(T.cmd,id+'|'+cred.c+'|'+a,{qos:0,retain:false});
+  });
+}
+
+async function login(){
+  unlockAudio();
+  const u=$('lu').value.trim(),p=$('lp').value,c=$('lc').value.trim();
+  if(!u||!p||!c){$('lerr').textContent='Fyll i alla fält';return}
+  cred={u,p,c};
+  $('lerr').textContent='Ansluter…';
+  connect();
+  if(!await waitConnected(12000)){
+    if(client){stopClient();$('lerr').textContent='Kunde inte ansluta till molnet'}
+    return;
+  }
+  const r=await send('check');
+  if(r.auth===false){showLogin(r.msg);return}
+  storeCred(cred);
+  showApp();
+  if(!r.ok)$('cmsg').textContent='Larmet svarar inte just nu – koden kontrolleras när det är online igen.';
+}
+
+function logout(){storeCred(null);cred=null;st=null;espOnline=null;showLogin()}
+
+async function cmd(a){
+  unlockAudio();
+  $('cmsg').textContent='Skickar…';$('cmsg').style.color='var(--mu)';
+  const r=await send(a);
+  if(r.auth===false&&r.msg==='Fel kod'){cred.c='';storeCred(cred);showLogin('Fel larmkod – har den ändrats?');return}
+  $('cmsg').textContent=r.msg||(r.ok?'Klart':'Något gick fel');
+  $('cmsg').style.color=r.ok?'var(--mu)':'var(--bad)';
+}
+
+function setConn(){
+  let t='',bad=true;
+  if(!client)t='';
+  else if(!client.connected)t='Ansluter till molnet…';
+  else if(espOnline===false)t='Larmet är offline – ingen ström eller internet hemma?';
+  else if(espOnline===null)t='Väntar på larmet…';
+  else{t='Larmet är online';bad=false}
+  $('conn').textContent=t;$('conn').style.color=bad?'var(--bad)':'var(--ok)';
+  $('app').classList.toggle('stale',bad);
+}
+
+const NAMES={disarmed:'Avlarmat',exit:'Utpassering',armed:'Larmat',entry:'Slå koden!',alarm:'LARM!'};
+function render(){
+  if(!st){$('state').textContent='…';$('info').textContent='';return}
+  const j=st;
+  let t=NAMES[j.mode]||j.mode;
+  if(j.mode=='armed'||j.mode=='exit')t+=j.type=='night'?' (natt)':' (borta)';
+  if(j.mode=='exit'||j.mode=='entry')t+=' '+j.left+' s';
+  $('state').textContent=t;$('state').className='st-'+j.mode;
+  const info=['Dörr: '+(j.door?'öppen':'stängd'),'Siren: '+(j.siren?'PÅ':'av')];
+  if(j.mem)info.unshift('Larmet har gått!');
+  if(j.night)info.push(j.skip?'Nattläge överhoppat i natt':'Nattfönster');
+  info.push('ändrat '+j.time);
+  $('info').textContent=info.join(' · ');
+  const lg=$('log');lg.innerHTML='';
+  (j.log||[]).forEach(l=>{const d=document.createElement('div');d.textContent=l;lg.appendChild(d)});
+  $('skipbtn').textContent=j.skip?'Aktivera nattläget i natt igen':'Hoppa över nattläget i natt';
+  updateAlarm();
+}
+
+// Larmvarning: fungerar bara medan sidan är öppen
+function unlockAudio(){try{if(!audio)audio=new(window.AudioContext||window.webkitAudioContext)();if(audio.state==='suspended')audio.resume()}catch(e){}}
+document.addEventListener('pointerdown',unlockAudio);
+function tone(){
+  if(!audio||audio.state!=='running'||muted)return;
+  const o=audio.createOscillator(),g=audio.createGain(),n=audio.currentTime;
+  o.type='square';g.gain.value=0.15;o.connect(g);g.connect(audio.destination);
+  o.frequency.setValueAtTime(880,n);o.frequency.setValueAtTime(660,n+0.25);
+  o.start(n);o.stop(n+0.5);
+}
+function updateAlarm(){
+  const on=!!st&&st.mode==='alarm'&&!$('app').classList.contains('hide');
+  $('alarm').classList.toggle('hide',!on);
+  if(on&&!beepTimer){
+    muted=false;tone();
+    beepTimer=setInterval(()=>{tone();if(!muted&&navigator.vibrate)navigator.vibrate([400,200,400])},1000);
+    document.title='LARM! – Hemlarm';
+  }
+  if(!on&&beepTimer){clearInterval(beepTimer);beepTimer=null;if(navigator.vibrate)navigator.vibrate(0);document.title='Hemlarm'}
+  if(on){
+    const sound=audio&&audio.state==='running'?'':' · Tryck på skärmen för ljud';
+    $('alarmInfo').textContent=(st.door?'Dörren är öppen':'Dörren är stängd')+(st.siren?' · Sirenen är på':'')+sound;
+  }
+}
+function mute(){muted=true;if(navigator.vibrate)navigator.vibrate(0)}
+
+// Telefonen kan stänga anslutningen i bakgrunden – anslut direkt när sidan visas igen
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&client&&!client.connected)client.reconnect()});
+$('lc').addEventListener('keydown',e=>{if(e.key=='Enter')login()});
+
+cred=loadCred();
+if(cred&&cred.u&&cred.p&&cred.c){showApp();connect()}else showLogin();
+</script>
+</body></html>
